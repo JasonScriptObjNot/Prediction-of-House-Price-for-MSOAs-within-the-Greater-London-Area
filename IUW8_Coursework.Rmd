@@ -1,0 +1,383 @@
+---
+title: "Prediction of Median House Price for MSOA's within the Greater London Area"
+author: "Jason Liu"
+date: "2024-07-09"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+```{r}
+# install and load necessary packages
+if(!require(ggplot2)) install.packages("tidyverse")
+library(tidyverse)
+if(!require(ggtext)) install.packages("ggtext")
+library(ggtext)
+if(!require(GGally)) install.packages("GGally")
+library(GGally)
+if(!require(MASS)) install.packages("MASS")
+library(MASS)
+select <- dplyr::select
+if(!require(leaps)) install.packages("leaps")
+library(leaps)
+if(!require(texreg)) install.packages("texreg")
+library(texreg)
+if(!require(cvTools)) install.packages("cvTools")
+library(cvTools)
+if(!require(car)) install.packages("car")
+library(car)
+```
+
+```{r}
+# import the dataset
+london <- read_csv("LondonData.csv", col_types = "cdffffdddddddd")
+```
+
+# Exploratory Data Analysis
+
+## Understanding Inner vs Outer by Population Density and Political Alignment
+
+### t-Test between Inner Status and Population Density
+```{r}
+t.test(Pop_Density ~ Inner, london)
+```
+
+### Violin Plots of Population Density by Inner Status and Political Alignment
+```{r}
+colour_palette <- c("#EFE600", "#d50000", "#0087dc")
+ggplot(london, aes(x = Inner, y = Pop_Density, fill = Political)) + 
+  scale_fill_manual(values = colour_palette) + 
+  geom_violin() +
+  ggtitle("Distribution of Population Density by Inner Status and Political Alignment")
+```
+
+### Discussion *(213 words)*
+The first thing to unpack with this dataset is that while there are many different variables, many of them probably provide similar information. The most apparent of these would be Inner and Pop_Density, as by definition, the Inner city is probably defined by central, higher density areas. <br>
+It then makes sense to run a Welch's Two Sample t-Test (assuming unequal variance) to test whether between Inner and Outer, the distributions each sample was drawn from have the same mean. Since it resulted in an extremely small p-value, we can say with a very high confidence level that they are definitely drawn from two distinct distributions, meaning that the Population Density is remarkably different between the Inner and Outer areas of London. <br>
+The violin plots further visualise this significant difference in (sample) distribution. Together, they definitively show that there is a strong correlation between variables Inner and Pop_Density, so for any linear models, we should probably choose only one of them to use, or else risk issues caused by multicollinearity. <br>
+Also, the different distributions for each Political Party show that somehow little to no subregions in Inner London favour any party considered "Other", and that relatively speaking, the Inner city slightly favors the Conservative party more and the Outer favours Labour a bit more.
+
+
+## Exploring BAME Demographics by Borough and Area
+
+### 5-Number (+Mean) Summary Statistic of the Distribution of BAME
+```{r}
+summary(london$BAME)
+```
+
+### BAME Distribution split by Borough and Area
+```{r}
+# creates a tibble with each Borough's mean BAME and sorts in descending order
+Borough_mean_BAME_desc <- london %>%
+  group_by(Borough) %>%
+  summarise(avg = mean(BAME)) %>%
+  arrange(desc(avg))
+# reorders the levels of Borough by descending mean BAME so it'll be shown as such in the plot
+london_reordered <- london %>% 
+  mutate(Borough = factor(Borough, levels = Borough_mean_BAME_desc$Borough, ordered = TRUE))
+  
+ggplot(london_reordered, aes(x = Borough, y = BAME, fill = Area)) + 
+  geom_boxplot() + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) + 
+  ggtitle("BAME Distribution by Borough, distinguished by Area")
+```
+
+### Discussion *(187 words)*
+The summary statistic shows that BAME ranges from 3.81 to 93.86 percent. By almost encompassing the entire possible range, this indicates that there’s a large amount of variety in the demographics between London's different subregions. <br>
+It's also shown that the data has a positive skew, so we’d expect that any variable used to accurately group subregions by demographics would clearly include those with similarly high BAME values within the same group. <br>
+As seen in our figure, grouping by Borough often leads to relatively tight distributions of BAME, meaning that Borough alone appears to reasonably represent the demographics of the subgroups within them. In other words, within each of London's Boroughs, most subregions share pretty similar demographics. <br>
+However, when considering Boroughs (and thus, subregions) within the same Area, they often don’t even have remotely similar BAME. <br>
+As a result, when creating a model to predict values for subregions, we now know that considering the Borough of each subregion will itself be representative of many demographic factors, but attempting to further group by Area will lead to a loss in its relationship with BAME (and likely other demographic metrics).
+
+
+## Assessing Viability of Boroughs as a useful grouping
+
+### Summary Statistics evaluating Theoretical Performance for possible values of K for K-fold CV
+```{r}
+# using Borough without modification would prevent K-fold CV entirely since:
+# sum(london$Borough == "City of London") == 1
+# , which would always cause K-fold to fail, 
+# so in order to even consider using Borough, we'd need to drop that data point
+london_dropped <- london %>%
+  filter(Borough != "City of London")
+
+# calculates the estimated probability that all levels (amount == i) of a factor manage to not fail R iterations of K-fold (failure caused by all points of a level being grouped into the same fold).
+# input parameters:
+#   n: numeric(1), total amount of data points
+#   w: numeric(1), fold width, dependent on (n %/% K), must be integer
+#   R: numeric(1), amount of iterations of K-fold
+#   factor_counts: numeric(i), amount of each level
+# output:
+#   numeric(1), estimated probability that all runs of K-fold would pass, under the given parameters
+calculate_prob_all_pass <- function(n, w, R, factor_counts){
+  prob_all_pass <- 1
+  for (count in factor_counts){
+    # below code is numerically identical to:
+    # factorial(w-1) / factorial(w-c) * factorial(n-c) / factorial(n-1)
+    # , but numeric values stored using IEEE 754 roll over to 'Inf.' upon using significantly large factorial(),
+    # so it's necessary to implement it in the below way to force simplification before storage
+    prob_fail <- 1
+    for (i in (w-1):(w-count + 1)){prob_fail <- prob_fail * i}
+    for (i in (n-1):(n-count + 1)){prob_fail <- prob_fail / i}
+    
+    prob_pass <- 1 - prob_fail
+    prob_all_pass <- prob_all_pass * prob_pass
+  }
+  prob_all_pass^R
+}
+
+# constructs final DataFrame, passing necessary values to run calculations
+n <- nrow(london_dropped)
+factor_counts <- unname(summary(london_dropped$Borough))[-1]
+k_eval <- data.frame(K = 3:12) %>%
+  mutate(R = 100 %/% K, w = n %/% K, 
+         prob_iters_fail = 1 - calculate_prob_all_pass(n, w, R, factor_counts), 
+         prob_samp_is_rep = 1 / choose(n, w))
+k_eval
+```
+
+### Visualizing Amount of MSOA's within Each Borough
+```{r}
+# filters only for subregions from Inner Boroughs
+london_inner_boroughs <- london %>%
+  filter(Inner == "Inner") %>%
+  group_by(Borough)
+# creates a vector listing all the Inner Boroughs
+inner_boroughs <- levels(london$Borough)[as.numeric(table(london_inner_boroughs$Borough)) != 0]
+
+london %>%
+  ggplot(aes(Borough)) + 
+  geom_bar(colour = "black", fill = "gray") + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1, colour = ifelse(levels(london$Borough) %in% inner_boroughs, 'purple', 'brown'))) + 
+  ggtitle("Count of Census Subregions for Each Borough (<span style = 'color: purple;'>Inner</span>/<span style = 'color: brown;'>Outer</span>)") + 
+  theme(plot.title = element_markdown())
+```
+
+### Discussion *(363 words)*
+*Note: This discussion is a little longer, but the others are quite under. Due to the much more complex nature of this exploration, it was unavoidable. *
+
+Since grouping by Area failed to accurately represent the many differences present between individual subgroups, we must instead consider using Borough as a key input parameter. <br>
+The initial colour-coded labels in the figure indicate that Inner Boroughs don't seem to consistently contain more or less subregions than Outer Boroughs. <br>
+However, the much more apparent observation is that London has many Boroughs and that the Boroughs each contain largely differing amounts of subregions. This causes two main issues: that using Borough as a parameter can run a risk of overfitting our data, so it's important to use K-fold cross validation effectively to check for this; and that K-fold will fail here since some Boroughs contain very few subregions, so if all of those ever fall within the same fold, a model will be tested for a categorical level it simply doesn't contain. <br>
+In fact, the current dataset has a 100% chance of this occurring since "City of London" contains only one datapoint, so it's always fully contained within a fold. However, by removing the problematic datapoint, the odds of K-fold failing now is dependent on the value of K since larger K means smaller folds, leading to a lower chance that a whole Borough falls within one. <br>
+Also, to get the most out of our actual split iterations (we'll specify 100 for our purposes), we want to reduce the odds of repeating any given train/test split. Smaller K has more possible ways to split the dataset, so a lower chance of repeats. <br>
+Since we want to minimize both of these values, it proved useful as a summary statistic to construct a table containing the values for each K we'd like to consider. The mathematical derivation of the formulas used to estimate the values are included below (the prob_samp_is_rep is just the odds during the second split, but it's informatively no different and is actually comprehensible). <br>
+The table indicates that choosing the value as K=8 appears to be best balance minimizing both values as decreasing to 7 sees a significant 17% increase in the failure probability and increasing to 9 sees a 229 billion times higher probability that any given sample is a repeat. <br>
+
+#### Derivation of Formula for *prob_iters_fail*
+$n =$ count of data points; $w =$ width of fold, truncated to the nearest whole; $c =$ occurrences of the given level. <br>
+So to consider $P(l_1)$, the probability of any given level failing by our specified condition, we calculate:
+$$P(l_1) = k (\frac{1}{k} \times \frac{w-1}{n-1} \times \frac{w-2}{n-2} \times ... \times \frac{w-c+1}{n-c+1})$$
+As whatever we consider the "first" value of the level must be in one of the K folds, then every following value needs to fall into one of the remaining spots within the width (one less each time) out of the total available spots (also decreasing each time), until the entire count of the level is exhausted. <br>
+So the total odds of one iteration (with $i$ different levels) failing would be: <br>
+$$P(L) = 1 - [(1- P(l_1)) \times (1- P(l_2)) \times ... \times (1- P(l_i)]$$
+Therefore, the odds of at least one of all the iterations ran failing would be:
+$$1 - (1 - P(L)) ^ R$$
+
+#### Derivation of Formula for *prob_samp_is_rep*
+Given the already defined values, we can consider the total amount of possible train/test splits as $n \choose w$. <br>
+So, to calculate the odds of a train/test split being a repeat (for our purpose, the second time it's sampled), we just do:
+$$\frac{1}{n \choose w}$$
+
+# Regression
+
+## Approach and Discussion (899 Words)
+*Note that for reasons quite apparent later on, it's best for standardization of our figures to always use the london_dropped dataset, which has the only MSOA within the City of London removed.*
+
+### Previewing Possible Relationships
+```{r}
+london_dropped %>%
+  select(-c(MSOA, Borough, Inner, Area, Political)) %>%
+  ggpairs()
+```
+
+Looking closer, LoneParent_HH, BAME, NoWork_Families, LowBirthWeight, and Male_LE actually all appear to be highly correlated with one another.
+```{r}
+london_dropped %>%
+  select(c(LoneParent_HH, BAME, NoWork_Families, Low_BirthWeight, Male_LE)) %>%
+  ggpairs()
+```
+
+Since these variables likely all provide similar information, it's best for our model's simplicity and correctness to only choose the most eligible of the five. The initial pairing plot seems to indicate that Male_LE may be a strong, linear, predictor for Median_HP.
+
+```{r}
+ggplot(london_dropped, aes(x = Male_LE, y = Median_HP)) + 
+  geom_point() +
+  geom_smooth(method='lm')
+summary(lm(Median_HP ~ Male_LE, data = london_dropped))
+```
+
+From the scatterplot, it appears that the correlation between Male_LE and Median_HP is quite linear, and a R^2 of 0.26 is quite high for a single variable linear regression within such a complex application. Using Male_LE will probably be the most effective way to accurately represent this set of variables.
+
+From the pairs plot, another set of variables that appear very highly correlated are: Pop_Density, Aged_15to64, and Rented.
+```{r}
+london_dropped %>%
+  select(c(Pop_Density, Aged_15to64, Rented)) %>%
+  ggpairs()
+```
+
+Again, it's probably best to just choose the most effective one to represent these values, or else we're going to run into issues with multicollinearity.
+
+The best of these appears to be Aged_15to64. 
+```{r}
+ggplot(london_dropped, aes(x = Aged_15to64, y = Median_HP)) + 
+  geom_point() + 
+  geom_smooth(method='lm')
+summary(lm(Median_HP ~ Aged_15to64, data = london_dropped))
+```
+
+Just like for Male_LE, the scatterplot indicates that a linear model is a good fit for the data. However, the R^2 is a little lower at 0.0475, but it's still the best choice we have to represent this set of variables.
+
+Within the exploratory analysis, we've already found that using Borough is the most representative way to group the subregions by geographic area.
+
+While using a factor with so many levels may raise concerns about possibly overfitting the data, we've already chosen the optimal value of K with which we can perform a sufficient amount of iterations to perform cross validation.
+
+```{r}
+ggplot(london_dropped, aes(x = Borough, y = Median_HP)) + 
+  geom_boxplot() + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+```
+
+Just by examining the distribution of Median_HP within each Borough, we observe pretty tight distributions within each of them, besides Kensington and Chelsea (as this Borough just consistently contains unprecedented values for most variables). This means that just knowing the Borough of a subregion can give us pretty effective insight on the Median House Price. Due to the clear benefit this factor immediately provides us, even if some of its levels don't prove to be statistically significant over the base level, its inclusion is well justified.
+
+### Model 1: Intuitive Approach Model
+From our examination of the dataset, the most intuitive way to create a model would be just to include the best representative variable from each of the 3 groups of variables, as described above.
+
+```{r}
+model1 <- lm(Median_HP ~ Borough + Male_LE + Aged_15to64, data = london_dropped)
+summary(model1)
+```
+
+### Model 2: Variable Selection by Statistical Significance
+It's a common approach to first try to run a multilinear regression model with every possible variable in it (besides those that are actual repeats) and then only keep the ones that are statistically significant.
+```{r}
+model_max <- lm(Median_HP ~ . - MSOA - Inner - Area - Political, data = london_dropped)
+summary(model_max)
+```
+Then, by choosing our variables, we get the following:
+```{r}
+model2 <- lm(Median_HP ~ Borough + Pop_Density + LoneParent_HH + BAME + NoWork_Families + Male_LE, data = london_dropped)
+summary(model2)
+```
+
+### Model 3: Stepwise Model Selection
+```{r}
+model_min <- lm(Median_HP ~ 1, data = london_dropped)
+# model_max is already defined above
+scp <- list(lower = model_min, upper = model_max)
+
+model3 <- stepAIC(model_min,
+                      direction = "forward",
+                      scope = scp)
+```
+The stepwise process selected all but two of the variables, prioritizing BAME first and MALE_LE not long after.
+```{r}
+summary(model3)
+```
+
+### Model 4: Variable Selection by Exhaustive Search 
+
+Making this method function in any useful way required forcing it to use all of Borough as an input or else it would try to pick and choose which levels it wanted.
+```{r}
+# this is performed on london (not london_dropped), but the results would just be offset by a set amount
+regsubsets_out <- regsubsets( Median_HP ~ . - MSOA - Inner - Area - Political,
+                             data = london,
+                             nbest = 1,
+                             nvmax = NULL,
+                             force.in = c(rep(TRUE, 32), rep(FALSE, 8)),
+                             force.out = NULL,
+                             method = 'exhaustive')
+
+# removes the different Borough levels (providing repeat info) and renames the remaining one in place
+df_out <- as.data.frame(summary(regsubsets_out)$outmat)[32:40]
+names(df_out)[names(df_out) == 'BoroughWestminster'] <- 'Borough'
+df_out
+```
+
+```{r}
+which.max(summary(regsubsets_out)$adjr)
+```
+The results indicate that 6 variables added onto Borough led to the most accurate model, making it the model with 38 variables. Constructing that model gives:
+```{r}
+# this uses london_dropped again, taking away the initial base level and making it 37 variables
+model4 <- lm(Median_HP ~ Borough + Pop_Density + Aged_15to64 + LoneParent_HH + BAME + NoWork_Families + Male_LE, data = london_dropped)
+summary(model4)
+```
+Note that this is entirely identical to Model 3, so for our comparison, we'll just refer to them together as Model 3. This does also add some extra credibility to this model as it was reached in two separate ways.
+
+### Comparing The Models
+Let's start by just considering some basic summary statistics.
+```{r}
+screenreg(list(model1, model2, model3))
+```
+All models have a quite high complexity, so the R^2 were all similarly reduced under adjustment. Model 3 has the best R^2, closely followed by Model 2. Also, one chosen variable, Aged_15to64 (present in Model 1 and Model 3), isn't statistically significant.
+
+While this does give us some insight, its absolutely necessary to check the accuracy under cross-validation. For efficiency, we'll use the K value we optimized earlier.
+
+*Note that while higher total iterations (achieved by higher R) would certainly be more effective, in order to keep the runtime reasonable, we'll limit it to 100 for now*
+```{r}
+set.seed(0)
+sqrt(mean(model1$residuals^2))
+cvFit(model1, data=london_dropped, y=london_dropped$Median_HP, K=8, R = 12)
+```
+
+```{r}
+set.seed(0)
+sqrt(mean(model2$residuals^2))
+cvFit(model2, data=london_dropped, y=london_dropped$Median_HP, K=8, R = 12)
+```
+
+```{r}
+set.seed(0)
+sqrt(mean(model3$residuals^2))
+cvFit(model3, data=london_dropped, y=london_dropped$Median_HP, K=8, R = 12)
+```
+
+All 3 of our models have a small amount of overfitting, with Model 1 having the least (RMSE increased by 6333) in comparison to Model 2 (6733) and Model 3 (7192). However, even controlling for this, it's still way more effective than if you were to not include Borough at all (shown below in a hypothetical Model 5)
+
+```{r}
+model5 <- lm(Median_HP ~ Pop_Density + Aged_15to64 + LoneParent_HH + BAME + NoWork_Families + Male_LE, data = london_dropped)
+sqrt(mean(model5$residuals^2))
+cvFit(model5, data=london_dropped, y=london_dropped$Median_HP, K=8, R = 12)
+```
+
+These results do give Model 1 a slight edge, but it's imperative we check if each model fulfills the preconditions to effectively utilize linear regression.
+
+```{r}
+plot(model1)
+```
+```{r}
+plot(model2)
+```
+
+Model 2 and Model 3 had practically indistinguishable diagnostic plots, so I'll save the space of showing Model 3's.
+
+Both sets of plots don't indicate any major issues. Model 1's Residuals vs Fitted looks a bit more homoskedastic, and the Normal Q-Q plot lifts off less on the lower tail (while both can't handle the upper). Scale Location and Residuals vs Leverage plots are almost identical and both passable.
+
+```{r}
+vif(model1)
+vif(model2)
+vif(model3)
+```
+The Variance Inflation Factors provide some startling insight as Models 2 and 3 display many extremely high VIF values. Our initial assessment of the variable relationships proves quite effective as many of these variables are quite correlated with eachother. Any attempt at removing multicollinear variables until this is resolved basically leads to the same selection as Model 1 (aside from Pop_Density and Aged_15to64 being interchangeable).
+
+Since the presence of multicollinearity artificially inflates R^2 and RSE, it's quite likely that the slightly higher fit values seen earlier were just the result of this.
+
+So despite the various statistics showing mixed results on which model was the best, the actual qualities of the data and realm of assumptions that can be made confirm that Model 1 is the best model.
+
+## Interpretation *(192 Words)*
+By interpreting the coefficients present in the model, we can see that the model predicts that a subregion in Barking and Dagenham with 0 for both Male_LE and Aged_15to64 would have Median_HP of -<span>&#163;</span>1644353.48 (which obviously isn't really possible). Then, for each of the different Boroughs, it predicts varying increases of a couple more <span>&#163;</span>10000's in Median_HP, with some increasing within <span>&#163;</span>200000-<span>&#163;</span>300000. This clearly describes how different Boroughs have significantly different House Prices. The model also predicts an increase in Median_HP of <span>&#163;</span>22021.91 for each percent increase in Male_LE and <span>&#163;</span>1874.17 for each percent increase in Aged_15to64.
+It is quite interesting that there was no single variable that was by far the most indicative of Median House Price, but rather it amounted to a careful combination of variables representing demographic factors, regional density, and geographic location.
+```{r}
+errors <- predict(model1, london_dropped) - london_dropped$Median_HP
+mean(abs(errors) <= 100000)
+```
+The model proves to be over 80% accurate in predicting House Price within <span>&#163;</span>100000.
+
+While it's certainly not perfect, the model's predictions are quite accurate, and the insight it provides on the relationships between the covariates and Median House Price are useful to infer how changing factors within an area may influence the cost of housing. 
+
+
+
+
